@@ -30,6 +30,21 @@ ShiftyMapper provides tools to generate various analysis maps from landscape hei
 4. Enable the plugin in Edit → Plugins → Terrain → ShiftyMapper
 5. Restart the editor when prompted
 
+## Dependencies & Requirements
+
+**v1.0 (Simplified Model) - Ready to Use:**
+- ✅ **No external dependencies required**
+- ✅ Works out-of-the-box with Unreal Engine 5.6
+- ✅ Uses only built-in Unreal APIs
+- ✅ Fast, real-time capable wind simulation
+
+**Future (Full WindNinja Solver) - Optional:**
+- GDAL library (for advanced DEM processing)
+- To enable: Set `bEnableFullWindNinjaSolver = true` in `ShiftyMapper.Build.cs`
+- See `WINDNINJA_INTEGRATION.md` for integration guide
+
+**The current v1.0 release does NOT require GDAL and works immediately after installation.**
+
 ## Quick Start - Blueprint
 
 ### Generate a Wind Flowmap

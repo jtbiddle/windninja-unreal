@@ -13,6 +13,16 @@ public class ShiftyMapper : ModuleRules
 		// Use Unreal's types instead of STL where possible
 		bUseUnity = false; // Disable unity builds for better debugging during development
 
+		// ============================================================================
+		// OPTIONAL: Enable full WindNinja solver integration with GDAL
+		// The simplified wind model (v1.0) does NOT require GDAL
+		// Only enable this when integrating the full mass-consistent solver
+		// See WINDNINJA_INTEGRATION.md for details
+		// ============================================================================
+		bool bEnableFullWindNinjaSolver = false;
+		// Uncomment the line below to enable full solver with GDAL:
+		// bEnableFullWindNinjaSolver = true;
+
 		PublicIncludePaths.AddRange(
 			new string[] {
 				Path.Combine(ModuleDirectory, "Public"),
@@ -48,29 +58,43 @@ public class ShiftyMapper : ModuleRules
 			}
 		);
 
-		// Platform-specific setup
-		if (Target.Platform == UnrealTargetPlatform.Win64)
-		{
-			SetupWindowsGDAL(Target);
-		}
-		else if (Target.Platform == UnrealTargetPlatform.Linux)
-		{
-			SetupLinuxGDAL(Target);
-		}
-		else if (Target.Platform == UnrealTargetPlatform.Mac)
-		{
-			SetupMacGDAL(Target);
-		}
-
-		// Compiler settings for WindNinja core
+		// Compiler settings
 		PublicDefinitions.Add("NOMINMAX=1"); // Prevent Windows.h from defining min/max macros
 
-		// Enable OpenMP for multi-threading if available
+		// ============================================================================
+		// GDAL Integration (Optional - only for full WindNinja solver)
+		// ============================================================================
+		if (bEnableFullWindNinjaSolver)
+		{
+			PublicDefinitions.Add("WITH_WINDNINJA_FULL_SOLVER=1");
+
+			// Setup GDAL based on platform
+			if (Target.Platform == UnrealTargetPlatform.Win64)
+			{
+				SetupWindowsGDAL(Target);
+			}
+			else if (Target.Platform == UnrealTargetPlatform.Linux)
+			{
+				SetupLinuxGDAL(Target);
+			}
+			else if (Target.Platform == UnrealTargetPlatform.Mac)
+			{
+				SetupMacGDAL(Target);
+			}
+		}
+		else
+		{
+			PublicDefinitions.Add("WITH_WINDNINJA_FULL_SOLVER=0");
+		}
+
+		// ============================================================================
+		// OpenMP for Multi-threading (Optional but recommended)
+		// ============================================================================
 		if (Target.Platform == UnrealTargetPlatform.Win64)
 		{
 			// MSVC OpenMP support
 			PrivateDefinitions.Add("_OPENMP=1");
-			// Note: Add /openmp flag in actual compilation
+			// Note: May need to add /openmp compiler flag
 		}
 		else if (Target.Platform == UnrealTargetPlatform.Linux)
 		{

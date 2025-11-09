@@ -15,15 +15,20 @@ void FShiftyMapperModule::StartupModule()
 
 	UE_LOG(LogTemp, Log, TEXT("ShiftyMapper module starting up..."));
 
-	// Load GDAL library
+#if WITH_WINDNINJA_FULL_SOLVER
+	// Load GDAL library (only needed for full WindNinja solver)
 	if (LoadGDAL())
 	{
 		UE_LOG(LogTemp, Log, TEXT("ShiftyMapper: GDAL library loaded successfully"));
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ShiftyMapper: Failed to load GDAL library - some features may not work"));
+		UE_LOG(LogTemp, Warning, TEXT("ShiftyMapper: Failed to load GDAL library - full WindNinja solver will not be available"));
 	}
+#else
+	UE_LOG(LogTemp, Log, TEXT("ShiftyMapper: Running with simplified wind model (GDAL not required)"));
+	UE_LOG(LogTemp, Log, TEXT("ShiftyMapper: To enable full WindNinja solver, set bEnableFullWindNinjaSolver=true in ShiftyMapper.Build.cs"));
+#endif
 
 	UE_LOG(LogTemp, Log, TEXT("ShiftyMapper module started successfully"));
 }
@@ -35,12 +40,15 @@ void FShiftyMapperModule::ShutdownModule()
 
 	UE_LOG(LogTemp, Log, TEXT("ShiftyMapper module shutting down..."));
 
+#if WITH_WINDNINJA_FULL_SOLVER
 	// Unload GDAL
 	UnloadGDAL();
+#endif
 
 	UE_LOG(LogTemp, Log, TEXT("ShiftyMapper module shut down successfully"));
 }
 
+#if WITH_WINDNINJA_FULL_SOLVER
 bool FShiftyMapperModule::LoadGDAL()
 {
 #if PLATFORM_WINDOWS
@@ -85,6 +93,7 @@ void FShiftyMapperModule::UnloadGDAL()
 	}
 #endif
 }
+#endif // WITH_WINDNINJA_FULL_SOLVER
 
 #undef LOCTEXT_NAMESPACE
 

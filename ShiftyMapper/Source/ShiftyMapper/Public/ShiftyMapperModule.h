@@ -47,6 +47,7 @@ public:
 	}
 
 private:
+#if WITH_WINDNINJA_FULL_SOLVER
 	/** Handle to the GDAL DLL (if dynamically loaded) */
 	void* GDALDllHandle = nullptr;
 
@@ -55,4 +56,5 @@ private:
 
 	/** Unload GDAL library */
 	void UnloadGDAL();
+#endif // WITH_WINDNINJA_FULL_SOLVER
 };
