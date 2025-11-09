@@ -1,0 +1,99 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Sunlight/insolation calculation compute shader for ShiftyMapper
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+RWTexture2D<float> OutputSunlight;
+
+float2 TextureSize;
+float CellSize;
+float3 SunDirection;
+float MaxShadowDistance;
+uint bCalculateShadows;
+uint bCalculateDiffuse;
+float AtmosphericScattering;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SunlightCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get height at current position
+	float height = InputHeightmap.Load(int3(coord, 0));
+
+	// Calculate normal from heightmap
+	float3 normal = float3(0, 0, 1);
+
+	if (bCalculateDiffuse)
+	{
+		// Sample neighboring heights
+		float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+		float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+		float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+		float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+		// Calculate gradient
+		float dx = (hR - hL) / (2.0 * CellSize);
+		float dy = (hD - hU) / (2.0 * CellSize);
+
+		// Construct normal
+		normal = normalize(float3(-dx, -dy, 1.0));
+	}
+
+	// Calculate diffuse lighting (Lambert)
+	float diffuse = saturate(dot(normal, normalize(SunDirection)));
+
+	// Calculate shadows if enabled
+	float shadow = 1.0;
+
+	if (bCalculateShadows)
+	{
+		// Ray marching for shadow calculation
+		float3 worldPos = float3(coord.x * CellSize, coord.y * CellSize, height);
+		float3 rayDir = normalize(SunDirection);
+
+		// March along ray towards sun
+		float maxDist = min(MaxShadowDistance, max(TextureSize.x, TextureSize.y) * CellSize);
+		float stepSize = CellSize * 0.5;
+		float marchDist = stepSize;
+
+		while (marchDist < maxDist)
+		{
+			// Current position along ray
+			float3 samplePos = worldPos + rayDir * marchDist;
+
+			// Convert to heightmap coordinates
+			float2 hmCoord = samplePos.xy / CellSize;
+
+			// Check if outside bounds
+			if (hmCoord.x < 0 || hmCoord.x >= TextureSize.x - 1 ||
+				hmCoord.y < 0 || hmCoord.y >= TextureSize.y - 1)
+				break;
+
+			// Sample terrain height at this position
+			int2 cellPos = int2(floor(hmCoord));
+			float terrainHeight = InputHeightmap.Load(int3(cellPos, 0));
+
+			// Check if ray is below terrain (in shadow)
+			if (samplePos.z < terrainHeight)
+			{
+				shadow = 0.0;
+				break;
+			}
+
+			marchDist += stepSize;
+		}
+	}
+
+	// Combine lighting components
+	float insolation = diffuse * shadow;
+
+	// Add atmospheric scattering (ambient light even in shadow)
+	insolation = saturate(insolation + AtmosphericScattering * (1.0 - shadow));
+
+	OutputSunlight[ThreadId.xy] = insolation;
+}

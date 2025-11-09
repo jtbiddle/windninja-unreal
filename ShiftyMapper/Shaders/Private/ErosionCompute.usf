@@ -1,0 +1,141 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Hydraulic erosion simulation compute shader for ShiftyMapper
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+Texture2D<float> PrecipitationMap;
+RWTexture2D<float> OutputHeightmap;
+RWTexture2D<float> OutputErosion;
+RWTexture2D<float> OutputDeposition;
+RWTexture2D<float> OutputFlow;
+
+float2 TextureSize;
+float CellSize;
+float ErosionRate;
+float DepositionRate;
+float EvaporationRate;
+float MinSlope;
+uint RandomSeed;
+
+// Simple hash function for random number generation
+uint Hash(uint s)
+{
+	s ^= 2747636419u;
+	s *= 2654435769u;
+	s ^= s >> 16;
+	s *= 2654435769u;
+	s ^= s >> 16;
+	s *= 2654435769u;
+	return s;
+}
+
+float Random(uint seed)
+{
+	return float(Hash(seed)) / 4294967295.0;
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ErosionCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get random starting position using thread ID and random seed
+	uint rngState = RandomSeed ^ (ThreadId.x * 73856093u) ^ (ThreadId.y * 19349663u);
+
+	// Initialize particle
+	float2 pos = float2(coord) + float2(Random(rngState), Random(rngState + 1));
+	float2 velocity = float2(0, 0);
+	float water = 1.0;
+	float sediment = 0.0;
+	float speed = 0.0;
+
+	// Get precipitation at this location
+	float precipitation = 1.0;
+	if (any(PrecipitationMap.Load(int3(coord, 0)) > 0.0))
+	{
+		precipitation = PrecipitationMap.Load(int3(coord, 0));
+	}
+	water *= precipitation;
+
+	// Simulate particle movement
+	const int maxSteps = 64;
+	for (int step = 0; step < maxSteps; step++)
+	{
+		// Current position
+		int2 cellPos = int2(floor(pos));
+
+		// Check bounds
+		if (cellPos.x < 0 || cellPos.x >= TextureSize.x - 1 ||
+			cellPos.y < 0 || cellPos.y >= TextureSize.y - 1)
+			break;
+
+		// Get heights at cell corners
+		float h00 = InputHeightmap.Load(int3(cellPos + int2(0, 0), 0));
+		float h10 = InputHeightmap.Load(int3(cellPos + int2(1, 0), 0));
+		float h01 = InputHeightmap.Load(int3(cellPos + int2(0, 1), 0));
+		float h11 = InputHeightmap.Load(int3(cellPos + int2(1, 1), 0));
+
+		// Bilinear interpolation
+		float2 t = frac(pos);
+		float height = lerp(lerp(h00, h10, t.x), lerp(h01, h11, t.x), t.y);
+
+		// Calculate gradient
+		float dx = lerp(h10 - h00, h11 - h01, t.y);
+		float dy = lerp(h01 - h00, h11 - h10, t.x);
+		float2 gradient = float2(dx, dy) / CellSize;
+
+		// Update velocity
+		velocity = velocity * 0.9 + gradient * 0.1; // Inertia + gradient
+		speed = length(velocity);
+
+		// Normalize velocity if non-zero
+		if (speed > 0.0001)
+			velocity /= speed;
+
+		// Calculate sediment capacity based on slope and water
+		float slope = length(gradient);
+		float capacity = max(slope, MinSlope) * speed * water * 4.0;
+
+		// Erosion/deposition
+		float erosionAmount = 0.0;
+		float depositionAmount = 0.0;
+
+		if (sediment > capacity)
+		{
+			// Deposit excess sediment
+			depositionAmount = (sediment - capacity) * DepositionRate;
+			sediment -= depositionAmount;
+
+			// Update deposition map
+			InterlockedAdd(OutputDeposition[cellPos], asuint(depositionAmount * 1000.0));
+		}
+		else
+		{
+			// Erode terrain
+			erosionAmount = min((capacity - sediment) * ErosionRate, height - MinSlope);
+			sediment += erosionAmount;
+
+			// Update erosion map
+			InterlockedAdd(OutputErosion[cellPos], asuint(erosionAmount * 1000.0));
+
+			// Update heightmap (erosion)
+			InterlockedAdd(OutputHeightmap[cellPos], asuint(-erosionAmount * 1000.0));
+		}
+
+		// Update flow accumulation
+		InterlockedAdd(OutputFlow[cellPos], asuint(water * 100.0));
+
+		// Move particle
+		pos += velocity * speed;
+
+		// Evaporate water
+		water *= (1.0 - EvaporationRate);
+
+		if (water < 0.01)
+			break;
+	}
+}

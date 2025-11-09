@@ -45,7 +45,8 @@ public class ShiftyMapper : ModuleRules
 				"CoreUObject",
 				"Engine",
 				"RenderCore",
-				"RHI"
+				"RHI",
+				"Renderer"  // For shader compilation
 			}
 		);
 
@@ -54,7 +55,9 @@ public class ShiftyMapper : ModuleRules
 			{
 				"Projects",
 				"ImageWrapper",
-				"ImageCore"
+				"ImageCore",
+				"Landscape",  // For landscape heightmap extraction
+				"Foliage"     // For vegetation analysis
 			}
 		);
 

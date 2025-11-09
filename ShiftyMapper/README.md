@@ -14,11 +14,20 @@ ShiftyMapper provides tools to generate various analysis maps from landscape hei
   - Configurable wind speed and direction
   - Multi-threaded computation
 
+### GPU-Accelerated Features (v2.0 - In Progress)
+- 🔄 **Curvature Analysis**: Plan, profile, mean, and Gaussian curvature (GPU compute)
+- 🔄 **Roughness Calculation**: Terrain roughness using multiple methods (GPU compute)
+- 🔄 **Hydraulic Erosion**: Particle-based erosion simulation (GPU compute)
+- 🔄 **Sunlight/Insolation**: Shadow-casting and diffuse lighting (GPU compute)
+- 🔄 **Groundwater Mapping**: Moisture and water table calculation
+- 🔄 **Vegetation Masks**: Grass/shrub/tree suitability analysis
+- 🔄 **Snowfall/Melt**: Temperature and elevation-based snow distribution
+- 🔄 **Landscape Support**: Direct heightmap extraction from Landscape actors
+- 🔄 **Curve Parameters**: Use Unreal curves for parameter control
+
 ### Planned Features
-- 🔄 **Full WindNinja Integration**: Mass-consistent wind solver for highly accurate simulations
+- 📋 **Full WindNinja Integration**: Mass-consistent wind solver for highly accurate simulations
 - 📋 **Normal Map Generation**: Calculate surface normals from heightmap
-- 📋 **Curvature Analysis**: Compute terrain curvature
-- 📋 **Erosion Simulation**: Simulate water erosion patterns
 - 📋 **Flow Accumulation**: Calculate water flow paths
 - 📋 **Slope & Aspect Maps**: Generate slope and aspect analysis maps
 

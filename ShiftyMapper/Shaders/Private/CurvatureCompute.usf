@@ -1,0 +1,92 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Curvature calculation compute shader for ShiftyMapper
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+RWTexture2D<float4> OutputCurvature;
+
+float2 TextureSize;
+float CellSize;
+float Scale;
+uint bCalculatePlan;
+uint bCalculateProfile;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void CurvatureCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	// Get heightmap coordinates
+	int2 coord = int2(ThreadId.xy);
+
+	// Sample heights in 3x3 neighborhood
+	float h00 = InputHeightmap.Load(int3(coord + int2(-1, -1), 0));
+	float h01 = InputHeightmap.Load(int3(coord + int2( 0, -1), 0));
+	float h02 = InputHeightmap.Load(int3(coord + int2( 1, -1), 0));
+
+	float h10 = InputHeightmap.Load(int3(coord + int2(-1,  0), 0));
+	float h11 = InputHeightmap.Load(int3(coord + int2( 0,  0), 0)); // Center
+	float h12 = InputHeightmap.Load(int3(coord + int2( 1,  0), 0));
+
+	float h20 = InputHeightmap.Load(int3(coord + int2(-1,  1), 0));
+	float h21 = InputHeightmap.Load(int3(coord + int2( 0,  1), 0));
+	float h22 = InputHeightmap.Load(int3(coord + int2( 1,  1), 0));
+
+	// Calculate first derivatives using central differences
+	float dz_dx = (h12 - h10) / (2.0 * CellSize);
+	float dz_dy = (h01 - h21) / (2.0 * CellSize);
+
+	// Calculate second derivatives
+	float d2z_dx2 = (h12 - 2.0 * h11 + h10) / (CellSize * CellSize);
+	float d2z_dy2 = (h01 - 2.0 * h11 + h21) / (CellSize * CellSize);
+	float d2z_dxdy = (h02 - h00 - h22 + h20) / (4.0 * CellSize * CellSize);
+
+	// Calculate slope components
+	float p = dz_dx;
+	float q = dz_dy;
+
+	// Calculate curvatures
+	float planCurvature = 0.0;
+	float profileCurvature = 0.0;
+	float meanCurvature = 0.0;
+	float gaussianCurvature = 0.0;
+
+	float p2 = p * p;
+	float q2 = q * q;
+	float pq = p * q;
+	float p2q2 = p2 + q2;
+
+	if (bCalculatePlan)
+	{
+		// Plan curvature (curvature perpendicular to slope direction)
+		if (p2q2 > 0.0)
+		{
+			planCurvature = (q2 * d2z_dx2 - 2.0 * pq * d2z_dxdy + p2 * d2z_dy2) / (p2q2 * sqrt(1.0 + p2q2));
+		}
+	}
+
+	if (bCalculateProfile)
+	{
+		// Profile curvature (curvature parallel to slope direction)
+		if (p2q2 > 0.0)
+		{
+			profileCurvature = (p2 * d2z_dx2 + 2.0 * pq * d2z_dxdy + q2 * d2z_dy2) / (p2q2 * pow(1.0 + p2q2, 1.5));
+		}
+	}
+
+	// Mean curvature
+	meanCurvature = -((1.0 + q2) * d2z_dx2 - 2.0 * pq * d2z_dxdy + (1.0 + p2) * d2z_dy2) / (2.0 * pow(1.0 + p2q2, 1.5));
+
+	// Gaussian curvature
+	gaussianCurvature = (d2z_dx2 * d2z_dy2 - d2z_dxdy * d2z_dxdy) / pow(1.0 + p2q2, 2.0);
+
+	// Output: R=plan, G=profile, B=mean, A=gaussian
+	OutputCurvature[ThreadId.xy] = float4(
+		planCurvature * Scale,
+		profileCurvature * Scale,
+		meanCurvature * Scale,
+		gaussianCurvature * Scale
+	);
+}
