@@ -1,5 +1,5 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-// Curvature calculation compute shader for ShiftyMapper
+// Terrain curvature calculation
+// Computes plan, profile, mean, and Gaussian curvature
 
 #include "/Engine/Public/Platform.ush"
 

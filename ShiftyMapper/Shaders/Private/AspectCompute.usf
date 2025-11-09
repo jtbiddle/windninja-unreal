@@ -1,0 +1,214 @@
+// Aspect calculation - Direction of steepest descent
+// Calculates slope direction using gradient analysis
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+RWTexture2D<float> OutputAspect;
+
+float2 TextureSize;
+float CellSize;
+uint bOutputRadians; // 0=degrees (0-360, default), 1=radians (0-2π)
+uint bNormalizeOutput; // 0=raw angle, 1=normalize to 0-1 range for texture
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void AspectCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Sample 3x3 neighborhood using Horn's method
+	// Layout:
+	// z1 z2 z3
+	// z4 z5 z6
+	// z7 z8 z9
+
+	float z1 = InputHeightmap.Load(int3(coord + int2(-1, -1), 0));
+	float z2 = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float z3 = InputHeightmap.Load(int3(coord + int2(1, -1), 0));
+
+	float z4 = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float z5 = InputHeightmap.Load(int3(coord + int2(0, 0), 0)); // center
+	float z6 = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+
+	float z7 = InputHeightmap.Load(int3(coord + int2(-1, 1), 0));
+	float z8 = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+	float z9 = InputHeightmap.Load(int3(coord + int2(1, 1), 0));
+
+	// Horn's method for gradient calculation
+	float dz_dx = ((z3 + 2.0 * z6 + z9) - (z1 + 2.0 * z4 + z7)) / (8.0 * CellSize);
+	float dz_dy = ((z7 + 2.0 * z8 + z9) - (z1 + 2.0 * z2 + z3)) / (8.0 * CellSize);
+
+	// Calculate aspect (direction of steepest descent)
+	// atan2 returns angle in radians from -π to π
+	// We need to convert to geographic aspect:
+	// - 0° = North (up in image, -Y direction)
+	// - 90° = East (right in image, +X direction)
+	// - 180° = South (down in image, +Y direction)
+	// - 270° = West (left in image, -X direction)
+
+	float aspect;
+
+	// Check for flat terrain
+	if (abs(dz_dx) < 0.0001 && abs(dz_dy) < 0.0001)
+	{
+		// Flat terrain - no aspect
+		aspect = -1.0; // Special value for flat areas
+	}
+	else
+	{
+		// Calculate aspect angle
+		// Note: We negate dz_dy because image Y increases downward
+		// but geographic North is up
+		aspect = atan2(dz_dx, -dz_dy);
+
+		// Convert from [-π, π] to [0, 2π]
+		if (aspect < 0.0)
+			aspect += 6.28318530717959; // 2*PI
+
+		// Convert to degrees if requested
+		if (!bOutputRadians)
+		{
+			aspect = aspect * 57.29577951308232; // Convert to degrees (180/PI)
+		}
+	}
+
+	// Normalize to 0-1 range if requested (useful for texture output)
+	if (bNormalizeOutput)
+	{
+		if (aspect < 0.0)
+		{
+			aspect = 0.0; // Flat areas map to 0
+		}
+		else
+		{
+			if (bOutputRadians)
+				aspect = aspect / 6.28318530717959; // Normalize [0, 2π] to [0, 1]
+			else
+				aspect = aspect / 360.0; // Normalize [0, 360] to [0, 1]
+		}
+	}
+
+	OutputAspect[ThreadId.xy] = aspect;
+}
+
+// ============================================================================
+// Combined Slope + Aspect output (for efficiency when both are needed)
+// ============================================================================
+
+RWTexture2D<float2> OutputSlopeAspect; // R=Slope (degrees), G=Aspect (degrees)
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SlopeAspectCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Sample 3x3 neighborhood
+	float z1 = InputHeightmap.Load(int3(coord + int2(-1, -1), 0));
+	float z2 = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float z3 = InputHeightmap.Load(int3(coord + int2(1, -1), 0));
+	float z4 = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float z5 = InputHeightmap.Load(int3(coord + int2(0, 0), 0));
+	float z6 = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float z7 = InputHeightmap.Load(int3(coord + int2(-1, 1), 0));
+	float z8 = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+	float z9 = InputHeightmap.Load(int3(coord + int2(1, 1), 0));
+
+	// Horn's method
+	float dz_dx = ((z3 + 2.0 * z6 + z9) - (z1 + 2.0 * z4 + z7)) / (8.0 * CellSize);
+	float dz_dy = ((z7 + 2.0 * z8 + z9) - (z1 + 2.0 * z2 + z3)) / (8.0 * CellSize);
+
+	// Calculate slope
+	float rise_run = sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
+	float slope = atan(rise_run) * 57.29577951308232; // degrees
+
+	// Calculate aspect
+	float aspect = atan2(dz_dx, -dz_dy);
+	if (aspect < 0.0)
+		aspect += 6.28318530717959;
+	aspect = aspect * 57.29577951308232; // degrees
+
+	// Handle flat terrain
+	if (rise_run < 0.0001)
+		aspect = -1.0;
+
+	OutputSlopeAspect[ThreadId.xy] = float2(slope, aspect);
+}
+
+// ============================================================================
+// Aspect as color-coded visualization (HSV color wheel)
+// ============================================================================
+
+RWTexture2D<float4> OutputAspectColor;
+
+float3 HSVtoRGB(float h, float s, float v)
+{
+	float c = v * s;
+	float x = c * (1.0 - abs(fmod(h * 6.0, 2.0) - 1.0));
+	float m = v - c;
+
+	float3 rgb;
+	if (h < 0.166667) // 0-60°
+		rgb = float3(c, x, 0);
+	else if (h < 0.333333) // 60-120°
+		rgb = float3(x, c, 0);
+	else if (h < 0.5) // 120-180°
+		rgb = float3(0, c, x);
+	else if (h < 0.666667) // 180-240°
+		rgb = float3(0, x, c);
+	else if (h < 0.833333) // 240-300°
+		rgb = float3(x, 0, c);
+	else // 300-360°
+		rgb = float3(c, 0, x);
+
+	return rgb + float3(m, m, m);
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void AspectColorCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Calculate aspect (same as above)
+	float z1 = InputHeightmap.Load(int3(coord + int2(-1, -1), 0));
+	float z2 = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float z3 = InputHeightmap.Load(int3(coord + int2(1, -1), 0));
+	float z4 = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float z6 = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float z7 = InputHeightmap.Load(int3(coord + int2(-1, 1), 0));
+	float z8 = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+	float z9 = InputHeightmap.Load(int3(coord + int2(1, 1), 0));
+
+	float dz_dx = ((z3 + 2.0 * z6 + z9) - (z1 + 2.0 * z4 + z7)) / (8.0 * CellSize);
+	float dz_dy = ((z7 + 2.0 * z8 + z9) - (z1 + 2.0 * z2 + z3)) / (8.0 * CellSize);
+
+	float aspect = atan2(dz_dx, -dz_dy);
+	if (aspect < 0.0)
+		aspect += 6.28318530717959;
+
+	float rise_run = sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
+
+	// Map aspect to hue (0-1), slope to saturation
+	float hue = aspect / 6.28318530717959;
+	float saturation = min(rise_run * 10.0, 1.0); // Scale slope to saturation
+	float value = 1.0;
+
+	// Flat areas are gray
+	if (rise_run < 0.0001)
+	{
+		OutputAspectColor[ThreadId.xy] = float4(0.5, 0.5, 0.5, 1.0);
+	}
+	else
+	{
+		float3 rgb = HSVtoRGB(hue, saturation, value);
+		OutputAspectColor[ThreadId.xy] = float4(rgb, 1.0);
+	}
+}

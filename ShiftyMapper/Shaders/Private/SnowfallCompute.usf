@@ -1,0 +1,384 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Snowfall and snow melt simulation
+// Energy balance model with temperature, radiation, and wind redistribution
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+Texture2D<float> InputSunlight; // From SunlightCompute.usf
+Texture2D<float> InputWindSpeed; // Optional wind speed map
+Texture2D<float> InputPrecipitation; // Precipitation map
+RWTexture2D<float> InOutSnowDepth; // Snow depth in meters (read and write for iterative)
+
+float2 TextureSize;
+float CellSize;
+float DeltaTime; // Time step in hours
+
+// Climate parameters
+float AirTemperature; // Air temperature at sea level (°C)
+float TemperatureLapseRate; // Temperature decrease per meter elevation (°C/m)
+float SnowlineElevation; // Elevation where snow begins to accumulate
+float PrecipitationRate; // Precipitation rate (m/hour)
+uint bPrecipitationIsSnow; // Whether precipitation falls as snow (or rain)
+
+// Melt parameters
+float MeltRate; // Base melt rate (m/hour per °C above 0)
+float SolarMeltFactor; // Solar radiation melt contribution
+float WindMeltFactor; // Wind-enhanced melt
+float GroundHeatFlux; // Ground heat flux (W/m²)
+
+// Redistribution parameters
+float WindRedistribution; // Wind redistribution strength (0-1)
+float MaxWindSpeed; // Maximum wind speed for redistribution
+float SlopeRedistribution; // Slope-based redistribution (avalanche factor)
+
+// ============================================================================
+// Simple energy balance snow accumulation and melt
+// ============================================================================
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SnowAccumulationCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get terrain data
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float currentSnowDepth = InOutSnowDepth.Load(int3(coord, 0));
+	float sunlight = InputSunlight.Load(int3(coord, 0));
+	float precipitation = InputPrecipitation.Load(int3(coord, 0));
+
+	// Calculate local temperature (elevation-dependent)
+	float temperature = AirTemperature - (height * TemperatureLapseRate);
+
+	// Determine if precipitation falls as snow or rain
+	float snowfall = 0.0;
+	float rainfall = 0.0;
+
+	if (bPrecipitationIsSnow || temperature < 0.0)
+	{
+		snowfall = precipitation * PrecipitationRate * DeltaTime;
+	}
+	else
+	{
+		rainfall = precipitation * PrecipitationRate * DeltaTime;
+	}
+
+	// Add snowfall
+	currentSnowDepth += snowfall;
+
+	// Calculate melt
+	float melt = 0.0;
+
+	if (temperature > 0.0 && currentSnowDepth > 0.0)
+	{
+		// Temperature-based melt
+		float tempMelt = MeltRate * temperature * DeltaTime;
+
+		// Solar radiation melt
+		float solarMelt = SolarMeltFactor * sunlight * DeltaTime;
+
+		// Total melt
+		melt = tempMelt + solarMelt;
+
+		// Limit melt to available snow
+		melt = min(melt, currentSnowDepth);
+	}
+
+	// Rain-on-snow melt enhancement
+	if (rainfall > 0.0 && currentSnowDepth > 0.0)
+	{
+		float rainMelt = rainfall * 0.1; // Rain enhances melt
+		melt += rainMelt;
+	}
+
+	// Update snow depth
+	currentSnowDepth -= melt;
+	currentSnowDepth = max(currentSnowDepth, 0.0);
+
+	InOutSnowDepth[ThreadId.xy] = currentSnowDepth;
+}
+
+// ============================================================================
+// Wind redistribution pass
+// Snow is blown from ridges and accumulates in sheltered areas
+// ============================================================================
+
+RWTexture2D<float> OutputSnowDepth;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SnowRedistributionCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float snowDepth = InOutSnowDepth.Load(int3(coord, 0));
+	float windSpeed = (InputWindSpeed.Load(int3(coord, 0)) > 0.0) ?
+	                  InputWindSpeed.Load(int3(coord, 0)) : 5.0; // Default 5 m/s
+
+	// Calculate terrain exposure
+	// Ridges (convex) lose snow, valleys (concave) gain snow
+
+	// Sample neighbors for curvature calculation
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	// Calculate curvature (2nd derivative)
+	float d2z_dx2 = (hR - 2.0 * height + hL) / (CellSize * CellSize);
+	float d2z_dy2 = (hD - 2.0 * height + hU) / (CellSize * CellSize);
+	float meanCurvature = (d2z_dx2 + d2z_dy2) * 0.5;
+
+	// Exposure factor: positive curvature = ridge (exposed), negative = valley (sheltered)
+	float exposure = meanCurvature;
+
+	// Wind effect: stronger wind = more redistribution
+	float windFactor = saturate(windSpeed / MaxWindSpeed);
+
+	// Calculate snow loss/gain
+	float redistribution = exposure * windFactor * WindRedistribution * snowDepth;
+
+	// Update snow depth
+	float newSnowDepth = snowDepth - redistribution * DeltaTime;
+	newSnowDepth = max(newSnowDepth, 0.0);
+
+	OutputSnowDepth[ThreadId.xy] = newSnowDepth;
+}
+
+// ============================================================================
+// Slope-based redistribution (avalanche/sloughing)
+// ============================================================================
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SnowAvalancheCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float snowDepth = InOutSnowDepth.Load(int3(coord, 0));
+
+	// Calculate slope
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	float dx = (hR - hL) / (2.0 * CellSize);
+	float dy = (hD - hU) / (2.0 * CellSize);
+	float slope = sqrt(dx * dx + dy * dy);
+	float slopeDegrees = atan(slope) * 57.29577951308232;
+
+	// Critical angle for snow stability (typically 30-45°)
+	float criticalAngle = 35.0;
+
+	if (slopeDegrees > criticalAngle && snowDepth > 0.1)
+	{
+		// Snow is unstable - calculate sloughing
+		float excessSlope = slopeDegrees - criticalAngle;
+		float sloughingRate = saturate(excessSlope / 10.0); // 0-1 over 10°
+
+		// Amount of snow to move
+		float snowToMove = snowDepth * sloughingRate * SlopeRedistribution * DeltaTime;
+
+		// Move snow downslope (simplified - find lowest neighbor)
+		float minHeight = height;
+		int2 flowDir = int2(0, 0);
+
+		int2 offsets[8] = {
+			int2(-1, -1), int2(0, -1), int2(1, -1),
+			int2(-1, 0), int2(1, 0),
+			int2(-1, 1), int2(0, 1), int2(1, 1)
+		};
+
+		for (int i = 0; i < 8; i++)
+		{
+			int2 neighborCoord = coord + offsets[i];
+			if (neighborCoord.x >= 0 && neighborCoord.x < TextureSize.x &&
+			    neighborCoord.y >= 0 && neighborCoord.y < TextureSize.y)
+			{
+				float neighborHeight = InputHeightmap.Load(int3(neighborCoord, 0));
+				if (neighborHeight < minHeight)
+				{
+					minHeight = neighborHeight;
+					flowDir = offsets[i];
+				}
+			}
+		}
+
+		// Remove snow from this cell (will be added to downslope cell in next pass)
+		snowDepth -= snowToMove;
+		snowDepth = max(snowDepth, 0.0);
+	}
+
+	OutputSnowDepth[ThreadId.xy] = snowDepth;
+}
+
+// ============================================================================
+// Combined snow simulation (accumulation + melt + redistribution)
+// ============================================================================
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SnowSimulationCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get all input data
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float currentSnowDepth = InOutSnowDepth.Load(int3(coord, 0));
+	float sunlight = InputSunlight.Load(int3(coord, 0));
+	float precipitation = InputPrecipitation.Load(int3(coord, 0));
+	float windSpeed = (InputWindSpeed.Load(int3(coord, 0)) > 0.0) ?
+	                  InputWindSpeed.Load(int3(coord, 0)) : 5.0;
+
+	// Calculate local temperature
+	float temperature = AirTemperature - (height * TemperatureLapseRate);
+
+	// ========================================================================
+	// STEP 1: ACCUMULATION
+	// ========================================================================
+
+	if (temperature < 2.0) // Snow forms below 2°C
+	{
+		float snowfall = precipitation * PrecipitationRate * DeltaTime;
+		currentSnowDepth += snowfall;
+	}
+
+	// ========================================================================
+	// STEP 2: MELT
+	// ========================================================================
+
+	if (temperature > 0.0 && currentSnowDepth > 0.0)
+	{
+		// Temperature melt
+		float tempMelt = MeltRate * temperature * DeltaTime;
+
+		// Solar melt
+		float solarMelt = SolarMeltFactor * sunlight * temperature * DeltaTime;
+
+		// Wind-enhanced melt (wind increases heat transfer)
+		float windMelt = WindMeltFactor * windSpeed * temperature * DeltaTime * 0.01;
+
+		float totalMelt = tempMelt + solarMelt + windMelt;
+		totalMelt = min(totalMelt, currentSnowDepth);
+
+		currentSnowDepth -= totalMelt;
+	}
+
+	// ========================================================================
+	// STEP 3: WIND REDISTRIBUTION
+	// ========================================================================
+
+	// Calculate terrain curvature
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	float d2z_dx2 = (hR - 2.0 * height + hL) / (CellSize * CellSize);
+	float d2z_dy2 = (hD - 2.0 * height + hU) / (CellSize * CellSize);
+	float curvature = (d2z_dx2 + d2z_dy2) * 0.5;
+
+	// Wind redistribution (ridges lose, valleys gain)
+	float windFactor = saturate(windSpeed / MaxWindSpeed);
+	float redistribution = curvature * windFactor * WindRedistribution * currentSnowDepth * DeltaTime;
+	currentSnowDepth -= redistribution;
+
+	// ========================================================================
+	// STEP 4: SLOPE LIMIT (prevent unrealistic accumulation on steep slopes)
+	// ========================================================================
+
+	float dx = (hR - hL) / (2.0 * CellSize);
+	float dy = (hD - hU) / (2.0 * CellSize);
+	float slope = sqrt(dx * dx + dy * dy);
+	float slopeDegrees = atan(slope) * 57.29577951308232;
+
+	// Maximum snow depth decreases with slope
+	float maxSnowDepth = 10.0; // 10m max on flat ground
+	if (slopeDegrees > 30.0)
+	{
+		maxSnowDepth *= max(0.0, 1.0 - (slopeDegrees - 30.0) / 30.0);
+	}
+
+	currentSnowDepth = min(currentSnowDepth, maxSnowDepth);
+
+	// ========================================================================
+	// OUTPUT
+	// ========================================================================
+
+	currentSnowDepth = max(currentSnowDepth, 0.0);
+	InOutSnowDepth[ThreadId.xy] = currentSnowDepth;
+}
+
+// ============================================================================
+// Snow age calculation (for visualization - older snow is more compacted)
+// ============================================================================
+
+RWTexture2D<float2> InOutSnowDepthAge; // R=Depth, G=Age in days
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SnowAgeCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	float2 snowData = InOutSnowDepthAge.Load(int3(coord, 0));
+	float snowDepth = snowData.r;
+	float snowAge = snowData.g;
+
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float temperature = AirTemperature - (height * TemperatureLapseRate);
+	float precipitation = InputPrecipitation.Load(int3(coord, 0));
+
+	// Add new snow
+	float newSnow = 0.0;
+	if (temperature < 2.0)
+	{
+		newSnow = precipitation * PrecipitationRate * DeltaTime;
+	}
+
+	if (newSnow > 0.0)
+	{
+		// Fresh snow resets age
+		float totalDepth = snowDepth + newSnow;
+		snowAge = (snowAge * snowDepth) / totalDepth; // Weighted average
+		snowDepth = totalDepth;
+	}
+	else if (snowDepth > 0.0)
+	{
+		// Age existing snow
+		snowAge += DeltaTime / 24.0; // Convert hours to days
+	}
+
+	// Melt (same as before)
+	if (temperature > 0.0 && snowDepth > 0.0)
+	{
+		float sunlight = InputSunlight.Load(int3(coord, 0));
+		float melt = (MeltRate * temperature + SolarMeltFactor * sunlight) * DeltaTime;
+		melt = min(melt, snowDepth);
+		snowDepth -= melt;
+
+		if (snowDepth <= 0.0)
+		{
+			snowAge = 0.0; // Reset age when all snow melts
+		}
+	}
+
+	snowDepth = max(snowDepth, 0.0);
+	snowAge = max(snowAge, 0.0);
+
+	InOutSnowDepthAge[ThreadId.xy] = float2(snowDepth, snowAge);
+}

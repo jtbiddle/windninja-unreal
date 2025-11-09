@@ -1,5 +1,5 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-// Sunlight/insolation calculation compute shader for ShiftyMapper
+// Sunlight and insolation calculation with shadow casting
+// Calculates direct and diffuse lighting from terrain geometry
 
 #include "/Engine/Public/Platform.ush"
 

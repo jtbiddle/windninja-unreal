@@ -1,0 +1,93 @@
+// Slope calculation using Horn's method
+// Weighted 3x3 kernel for accurate slope estimation
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+RWTexture2D<float> OutputSlope;
+
+float2 TextureSize;
+float CellSize;
+uint bOutputRadians; // 0=degrees (default), 1=radians
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SlopeCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Sample 3x3 neighborhood for Horn's method
+	// Layout:
+	// z1 z2 z3
+	// z4 z5 z6
+	// z7 z8 z9
+
+	float z1 = InputHeightmap.Load(int3(coord + int2(-1, -1), 0));
+	float z2 = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float z3 = InputHeightmap.Load(int3(coord + int2(1, -1), 0));
+
+	float z4 = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float z5 = InputHeightmap.Load(int3(coord + int2(0, 0), 0)); // center
+	float z6 = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+
+	float z7 = InputHeightmap.Load(int3(coord + int2(-1, 1), 0));
+	float z8 = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+	float z9 = InputHeightmap.Load(int3(coord + int2(1, 1), 0));
+
+	// Horn's method (1981) - Weighted 3x3 kernel
+	// This method is more accurate than simple gradient and is the industry standard
+	// dz/dx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8 * cellSize)
+	// dz/dy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8 * cellSize)
+
+	float dz_dx = ((z3 + 2.0 * z6 + z9) - (z1 + 2.0 * z4 + z7)) / (8.0 * CellSize);
+	float dz_dy = ((z7 + 2.0 * z8 + z9) - (z1 + 2.0 * z2 + z3)) / (8.0 * CellSize);
+
+	// Calculate slope magnitude
+	float rise_run = sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
+
+	// Convert to angle
+	float slope;
+	if (bOutputRadians)
+	{
+		slope = atan(rise_run); // Output in radians
+	}
+	else
+	{
+		slope = atan(rise_run) * 57.29577951308232; // Convert to degrees (180/PI)
+	}
+
+	OutputSlope[ThreadId.xy] = slope;
+}
+
+// ============================================================================
+// Fast approximate version for real-time preview
+// ============================================================================
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SlopeFastCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Simple 2x2 gradient (faster but less accurate)
+	float h00 = InputHeightmap.Load(int3(coord + int2(0, 0), 0));
+	float h10 = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float h01 = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	float dz_dx = (h10 - h00) / CellSize;
+	float dz_dy = (h01 - h00) / CellSize;
+
+	float rise_run = sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
+
+	float slope;
+	if (bOutputRadians)
+		slope = atan(rise_run);
+	else
+		slope = atan(rise_run) * 57.29577951308232;
+
+	OutputSlope[ThreadId.xy] = slope;
+}

@@ -1,0 +1,223 @@
+// Groundwater and soil moisture simulation
+// Topographic wetness index and flow-based moisture calculation
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+Texture2D<float> InputFlowAccumulation; // From FlowAccumulationCompute.usf
+Texture2D<float> InputPrecipitation; // Optional precipitation map
+RWTexture2D<float> OutputGroundwater;
+
+float2 TextureSize;
+float CellSize;
+float BasePermeability; // Base soil permeability (0-1, higher = drains faster)
+float EvaporationRate; // Rate of moisture loss (0-1)
+uint bUsePrecipitation; // Whether to use precipitation map
+float PrecipitationAmount; // Uniform precipitation if no map
+
+// ============================================================================
+// Topographic Wetness Index (TWI) calculation
+// TWI = ln(a / tan(β))
+// where: a = upslope contributing area per unit contour length
+//        β = local slope
+// Higher TWI = more likely to be saturated
+// ============================================================================
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void GroundwaterTWICS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get flow accumulation (upslope contributing area)
+	float flowAccum = InputFlowAccumulation.Load(int3(coord, 0));
+
+	// Calculate local slope using central difference
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	float dx = (hR - hL) / (2.0 * CellSize);
+	float dy = (hD - hU) / (2.0 * CellSize);
+	float slope = sqrt(dx * dx + dy * dy);
+
+	// Avoid division by zero for flat areas
+	slope = max(slope, 0.001);
+
+	// Calculate specific catchment area (contributing area per unit contour length)
+	// For grid cells: a = (flowAccum * cellSize) / cellSize = flowAccum
+	float catchmentArea = flowAccum * CellSize;
+
+	// Topographic Wetness Index
+	float twi = log(max(catchmentArea, 1.0) / max(tan(atan(slope)), 0.001));
+
+	// Get precipitation
+	float precipitation = PrecipitationAmount;
+	if (bUsePrecipitation)
+	{
+		precipitation = InputPrecipitation.Load(int3(coord, 0));
+	}
+
+	// Calculate groundwater potential
+	// Higher TWI + higher precipitation = more groundwater
+	// Adjust by permeability (lower permeability = retains more water)
+	float groundwater = twi * precipitation * (1.0 - BasePermeability);
+
+	// Apply evaporation
+	groundwater *= (1.0 - EvaporationRate);
+
+	// Normalize to 0-1 range (twi typically ranges from -5 to 20)
+	groundwater = saturate(groundwater / 10.0);
+
+	OutputGroundwater[ThreadId.xy] = groundwater;
+}
+
+// ============================================================================
+// Multi-pass iterative groundwater flow simulation
+// More physically accurate but requires multiple passes
+// ============================================================================
+
+Texture2D<float> InputSoilDepth; // Optional soil depth map
+RWTexture2D<float> InOutWaterTable; // Water table height (read and write)
+
+float DeltaTime;
+float HydraulicConductivity; // Darcy's law coefficient
+float Porosity; // Soil porosity (0-1)
+float Recharge; // Groundwater recharge rate from precipitation
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void GroundwaterFlowCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Read current water table height
+	float waterTable = InOutWaterTable.Load(int3(coord, 0));
+	float terrainHeight = InputHeightmap.Load(int3(coord, 0));
+
+	// Calculate hydraulic head (water table elevation)
+	float head = terrainHeight + waterTable;
+
+	// Sample neighboring hydraulic heads
+	float headN = InputHeightmap.Load(int3(coord + int2(0, -1), 0)) +
+	              InOutWaterTable.Load(int3(coord + int2(0, -1), 0));
+	float headS = InputHeightmap.Load(int3(coord + int2(0, 1), 0)) +
+	              InOutWaterTable.Load(int3(coord + int2(0, 1), 0));
+	float headE = InputHeightmap.Load(int3(coord + int2(1, 0), 0)) +
+	              InOutWaterTable.Load(int3(coord + int2(1, 0), 0));
+	float headW = InputHeightmap.Load(int3(coord + int2(-1, 0), 0)) +
+	              InOutWaterTable.Load(int3(coord + int2(-1, 0), 0));
+
+	// Calculate hydraulic gradients (Darcy's law)
+	float gradN = (head - headN) / CellSize;
+	float gradS = (head - headS) / CellSize;
+	float gradE = (head - headE) / CellSize;
+	float gradW = (head - headW) / CellSize;
+
+	// Calculate flow rates (Darcy's law: Q = -K * A * (dh/dl))
+	// K = hydraulic conductivity, A = cross-sectional area, dh/dl = gradient
+	float flowN = -HydraulicConductivity * CellSize * gradN;
+	float flowS = -HydraulicConductivity * CellSize * gradS;
+	float flowE = -HydraulicConductivity * CellSize * gradE;
+	float flowW = -HydraulicConductivity * CellSize * gradW;
+
+	// Net flow (positive = inflow, negative = outflow)
+	float netFlow = (flowN + flowS + flowE + flowW) * DeltaTime;
+
+	// Add recharge from precipitation
+	float precipitation = PrecipitationAmount;
+	if (bUsePrecipitation)
+	{
+		precipitation = InputPrecipitation.Load(int3(coord, 0));
+	}
+	float rechargeVolume = precipitation * Recharge * CellSize * CellSize * DeltaTime;
+
+	// Update water table height
+	// Volume change = netFlow + recharge
+	// Height change = volume / (area * porosity)
+	float cellArea = CellSize * CellSize;
+	float waterTableChange = (netFlow + rechargeVolume) / (cellArea * Porosity);
+
+	float newWaterTable = waterTable + waterTableChange;
+
+	// Clamp to reasonable values
+	newWaterTable = clamp(newWaterTable, 0.0, 100.0); // Max 100m above terrain
+
+	// Output moisture level (normalized)
+	float moisture = saturate(newWaterTable / 10.0); // Normalize assuming 10m is "saturated"
+
+	OutputGroundwater[ThreadId.xy] = moisture;
+}
+
+// ============================================================================
+// Simplified soil moisture based on terrain position
+// Fast single-pass approximation for gameplay/vegetation
+// ============================================================================
+
+RWTexture2D<float> OutputSoilMoisture;
+
+float ValleyBonus; // Extra moisture in valleys (0-1)
+float SlopeReduction; // Moisture reduction on slopes (0-1)
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SoilMoistureCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get flow accumulation (indicates valleys/drainage)
+	float flowAccum = InputFlowAccumulation.Load(int3(coord, 0));
+
+	// Calculate local slope
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+	float centerHeight = InputHeightmap.Load(int3(coord, 0));
+
+	float dx = (hR - hL) / (2.0 * CellSize);
+	float dy = (hD - hU) / (2.0 * CellSize);
+	float slope = sqrt(dx * dx + dy * dy);
+	float slopeDegrees = atan(slope) * 57.29577951308232;
+
+	// Calculate profile curvature (concave = valley, convex = ridge)
+	float d2z_dy2 = (hU - 2.0 * centerHeight + hD) / (CellSize * CellSize);
+	bool isValley = d2z_dy2 < -0.0001; // Concave (negative curvature)
+
+	// Base moisture from precipitation
+	float moisture = PrecipitationAmount;
+	if (bUsePrecipitation)
+	{
+		moisture = InputPrecipitation.Load(int3(coord, 0));
+	}
+
+	// Increase moisture in areas with high flow accumulation (valleys, streams)
+	float flowFactor = saturate(log(flowAccum + 1.0) / 10.0);
+	moisture += flowFactor * ValleyBonus;
+
+	// Bonus for valley landforms
+	if (isValley)
+	{
+		moisture += 0.2 * ValleyBonus;
+	}
+
+	// Reduce moisture on steep slopes (drainage)
+	float slopeFactor = saturate(slopeDegrees / 45.0); // 0 at flat, 1 at 45°+
+	moisture *= (1.0 - slopeFactor * SlopeReduction);
+
+	// Reduce by permeability and evaporation
+	moisture *= (1.0 - BasePermeability * 0.5);
+	moisture *= (1.0 - EvaporationRate);
+
+	// Normalize
+	moisture = saturate(moisture);
+
+	OutputSoilMoisture[ThreadId.xy] = moisture;
+}

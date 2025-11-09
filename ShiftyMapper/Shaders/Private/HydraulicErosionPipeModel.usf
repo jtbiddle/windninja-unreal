@@ -1,0 +1,274 @@
+// Hydraulic erosion using pipe model simulation
+// Multi-pass physically-based water flow and sediment transport
+
+#include "/Engine/Public/Platform.ush"
+
+// Input/Output textures
+Texture2D<float> InputHeightmap;
+Texture2D<float> InputWaterMap;
+Texture2D<float4> InputFluxMap;      // Outflow flux (N,S,E,W)
+Texture2D<float> InputSedimentMap;
+Texture2D<float> PrecipitationMap;
+
+RWTexture2D<float> OutputHeightmap;
+RWTexture2D<float> OutputWaterMap;
+RWTexture2D<float4> OutputFluxMap;
+RWTexture2D<float> OutputSedimentMap;
+RWTexture2D<float> OutputVelocityMap;
+
+// Parameters
+float2 TextureSize;
+float CellSize;
+float DeltaTime;
+float Gravity;
+float PipeLength;
+float PipeArea;
+
+// Erosion parameters
+float SedimentCapacity;     // Kc in stream power law
+float Dissolving;          // Ks - erosion rate
+float Deposition;          // Kd - deposition rate
+float EvaporationRate;
+float MinWaterHeight;      // Minimum water to cause erosion
+
+// Rain
+float RainRate;
+
+// ============================================================================
+// Step 1: Add water from precipitation
+// ============================================================================
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void WaterIncrementCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+
+    float water = InputWaterMap.Load(int3(coord, 0));
+
+    // Add precipitation
+    float precipitation = RainRate;
+    if (any(PrecipitationMap.Load(int3(coord, 0)) > 0.0))
+    {
+        precipitation *= PrecipitationMap.Load(int3(coord, 0));
+    }
+
+    water += precipitation * DeltaTime;
+
+    OutputWaterMap[coord] = water;
+}
+
+// ============================================================================
+// Step 2: Calculate outflow flux using pipe model
+// ============================================================================
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void FlowSimulationCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+
+    float height = InputHeightmap.Load(int3(coord, 0));
+    float water = InputWaterMap.Load(int3(coord, 0));
+    float4 flux = InputFluxMap.Load(int3(coord, 0)); // Previous flux (N,S,E,W)
+
+    // Neighbor coordinates
+    int2 coordN = coord + int2(0, -1);
+    int2 coordS = coord + int2(0, 1);
+    int2 coordE = coord + int2(1, 0);
+    int2 coordW = coord + int2(-1, 0);
+
+    // Calculate new flux for each pipe
+    float4 newFlux = flux;
+
+    // North
+    if (coordN.y >= 0)
+    {
+        float heightN = InputHeightmap.Load(int3(coordN, 0));
+        float waterN = InputWaterMap.Load(int3(coordN, 0));
+        float deltaH = (height + water) - (heightN + waterN);
+        newFlux.x = max(0, flux.x + DeltaTime * (PipeArea * Gravity * deltaH) / PipeLength);
+    }
+
+    // South
+    if (coordS.y < TextureSize.y)
+    {
+        float heightS = InputHeightmap.Load(int3(coordS, 0));
+        float waterS = InputWaterMap.Load(int3(coordS, 0));
+        float deltaH = (height + water) - (heightS + waterS);
+        newFlux.y = max(0, flux.y + DeltaTime * (PipeArea * Gravity * deltaH) / PipeLength);
+    }
+
+    // East
+    if (coordE.x < TextureSize.x)
+    {
+        float heightE = InputHeightmap.Load(int3(coordE, 0));
+        float waterE = InputWaterMap.Load(int3(coordE, 0));
+        float deltaH = (height + water) - (heightE + waterE);
+        newFlux.z = max(0, flux.z + DeltaTime * (PipeArea * Gravity * deltaH) / PipeLength);
+    }
+
+    // West
+    if (coordW.x >= 0)
+    {
+        float heightW = InputHeightmap.Load(int3(coordW, 0));
+        float waterW = InputWaterMap.Load(int3(coordW, 0));
+        float deltaH = (height + water) - (heightW + waterW);
+        newFlux.w = max(0, flux.w + DeltaTime * (PipeArea * Gravity * deltaH) / PipeLength);
+    }
+
+    // Scale flux to prevent negative water
+    float totalOutflow = newFlux.x + newFlux.y + newFlux.z + newFlux.w;
+    if (totalOutflow > 0.0)
+    {
+        float K = min(1.0, water * CellSize * CellSize / (totalOutflow * DeltaTime));
+        newFlux *= K;
+    }
+
+    OutputFluxMap[coord] = newFlux;
+}
+
+// ============================================================================
+// Step 3: Update water height and calculate velocity
+// ============================================================================
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void WaterUpdateCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+
+    float water = InputWaterMap.Load(int3(coord, 0));
+    float4 flux = OutputFluxMap.Load(int3(coord, 0)); // Outflow
+
+    // Calculate inflow from neighbors
+    float inflowN = 0.0, inflowS = 0.0, inflowE = 0.0, inflowW = 0.0;
+
+    int2 coordN = coord + int2(0, -1);
+    int2 coordS = coord + int2(0, 1);
+    int2 coordE = coord + int2(1, 0);
+    int2 coordW = coord + int2(-1, 0);
+
+    if (coordN.y >= 0)
+        inflowS = OutputFluxMap.Load(int3(coordN, 0)).y; // Their south = our north
+
+    if (coordS.y < TextureSize.y)
+        inflowN = OutputFluxMap.Load(int3(coordS, 0)).x; // Their north = our south
+
+    if (coordE.x < TextureSize.x)
+        inflowW = OutputFluxMap.Load(int3(coordE, 0)).w; // Their west = our east
+
+    if (coordW.x >= 0)
+        inflowE = OutputFluxMap.Load(int3(coordW, 0)).z; // Their east = our west
+
+    // Update water height
+    float totalInflow = inflowN + inflowS + inflowE + inflowW;
+    float totalOutflow = flux.x + flux.y + flux.z + flux.w;
+    float cellArea = CellSize * CellSize;
+
+    float deltaVolume = (totalInflow - totalOutflow) * DeltaTime;
+    water += deltaVolume / cellArea;
+
+    // Evaporation
+    water *= (1.0 - EvaporationRate * DeltaTime);
+    water = max(0.0, water);
+
+    // Calculate velocity
+    float avgWater = max(water, 0.001); // Prevent division by zero
+    float2 velocity = float2(
+        (inflowW - flux.z + flux.w - inflowE) / cellArea,
+        (inflowN - flux.x + flux.y - inflowS) / cellArea
+    );
+    float velocityMag = length(velocity) / avgWater;
+
+    OutputWaterMap[coord] = water;
+    OutputVelocityMap[coord] = velocityMag;
+}
+
+// ============================================================================
+// Step 4: Erosion and Deposition using Stream Power Law
+// ============================================================================
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ErosionDepositionCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+
+    float height = InputHeightmap.Load(int3(coord, 0));
+    float water = OutputWaterMap.Load(int3(coord, 0));
+    float velocity = OutputVelocityMap.Load(int3(coord, 0));
+    float sediment = InputSedimentMap.Load(int3(coord, 0));
+
+    if (water < MinWaterHeight)
+    {
+        OutputHeightmap[coord] = height;
+        OutputSedimentMap[coord] = sediment;
+        return;
+    }
+
+    // Calculate local slope
+    float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+    float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+    float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+    float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+    float2 gradient = float2((hR - hL) / (2.0 * CellSize), (hD - hU) / (2.0 * CellSize));
+    float slope = length(gradient);
+
+    // Stream power law: Capacity = Kc * velocity * slope
+    float capacity = SedimentCapacity * velocity * slope;
+
+    float deltaHeight = 0.0;
+    float deltaSediment = 0.0;
+
+    if (capacity > sediment)
+    {
+        // Erosion
+        float erosionAmount = Dissolving * (capacity - sediment);
+        deltaHeight = -erosionAmount * DeltaTime;
+        deltaSediment = erosionAmount * DeltaTime;
+    }
+    else
+    {
+        // Deposition
+        float depositionAmount = Deposition * (sediment - capacity);
+        deltaHeight = depositionAmount * DeltaTime;
+        deltaSediment = -depositionAmount * DeltaTime;
+    }
+
+    OutputHeightmap[coord] = height + deltaHeight;
+    OutputSedimentMap[coord] = max(0.0, sediment + deltaSediment);
+}
+
+// ============================================================================
+// Step 5: Sediment Transport
+// ============================================================================
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void SedimentTransportCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+
+    float4 flux = OutputFluxMap.Load(int3(coord, 0));
+    float sediment = OutputSedimentMap.Load(int3(coord, 0));
+
+    // Transport sediment with water flow
+    float totalOutflow = flux.x + flux.y + flux.z + flux.w;
+
+    if (totalOutflow > 0.0)
+    {
+        // Sediment leaves with outflow
+        float sedimentOut = sediment * totalOutflow / (totalOutflow + 0.001);
+
+        // Distribute to neighbors based on flux
+        // Note: This is simplified - full implementation would gather from neighbors
+        OutputSedimentMap[coord] = sediment - sedimentOut;
+    }
+}

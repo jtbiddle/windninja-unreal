@@ -1,0 +1,110 @@
+// Flow accumulation using D8 algorithm
+// Calculates drainage flow direction and accumulation
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+RWTexture2D<float> OutputFlowAccumulation;
+RWTexture2D<int2> OutputFlowDirection;
+
+float2 TextureSize;
+float CellSize;
+
+// D8 flow direction offsets (N, NE, E, SE, S, SW, W, NW)
+static const int2 D8Offsets[8] = {
+    int2(0, -1),  // N
+    int2(1, -1),  // NE
+    int2(1, 0),   // E
+    int2(1, 1),   // SE
+    int2(0, 1),   // S
+    int2(-1, 1),  // SW
+    int2(-1, 0),  // W
+    int2(-1, -1)  // NW
+};
+
+// Distance to neighbors (1.0 for cardinal, 1.414 for diagonal)
+static const float D8Distances[8] = {
+    1.0, 1.414, 1.0, 1.414, 1.0, 1.414, 1.0, 1.414
+};
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void FlowDirectionCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+    float centerHeight = InputHeightmap.Load(int3(coord, 0));
+
+    // Find steepest descent direction (D8 algorithm)
+    int flowDir = -1;
+    float maxSlope = 0.0;
+
+    for (int i = 0; i < 8; i++)
+    {
+        int2 neighborCoord = coord + D8Offsets[i];
+
+        // Check bounds
+        if (neighborCoord.x < 0 || neighborCoord.x >= TextureSize.x ||
+            neighborCoord.y < 0 || neighborCoord.y >= TextureSize.y)
+            continue;
+
+        float neighborHeight = InputHeightmap.Load(int3(neighborCoord, 0));
+        float heightDiff = centerHeight - neighborHeight;
+
+        // Only flow downhill
+        if (heightDiff > 0.0)
+        {
+            float distance = CellSize * D8Distances[i];
+            float slope = heightDiff / distance;
+
+            if (slope > maxSlope)
+            {
+                maxSlope = slope;
+                flowDir = i;
+            }
+        }
+    }
+
+    // Store flow direction (-1 if pit/flat, otherwise 0-7)
+    OutputFlowDirection[coord] = int2(flowDir, maxSlope > 0.0 ? 1 : 0);
+}
+
+groupshared int sortedCells[THREADGROUP_SIZE * THREADGROUP_SIZE * 2]; // x,y pairs
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void FlowAccumulationCS(uint3 ThreadId : SV_DispatchThreadID, uint3 GroupThreadId : SV_GroupThreadID)
+{
+    if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+        return;
+
+    int2 coord = int2(ThreadId.xy);
+
+    // Initialize accumulation to 1 (cell contributes itself)
+    OutputFlowAccumulation[coord] = 1.0;
+
+    // Synchronize
+    GroupMemoryBarrierWithGroupSync();
+
+    // Note: Full D8 accumulation requires global sorting by elevation
+    // This is a simplified per-tile version
+    // For production, use a multi-pass approach with elevation sorting
+
+    // Read flow direction
+    int2 flowData = OutputFlowDirection.Load(int3(coord, 0));
+    int flowDir = flowData.x;
+
+    if (flowDir >= 0 && flowDir < 8)
+    {
+        int2 targetCoord = coord + D8Offsets[flowDir];
+
+        // Check bounds
+        if (targetCoord.x >= 0 && targetCoord.x < TextureSize.x &&
+            targetCoord.y >= 0 && targetCoord.y < TextureSize.y)
+        {
+            // Accumulate flow to downstream cell
+            // Note: This uses atomic add for thread safety
+            InterlockedAdd(OutputFlowAccumulation[targetCoord], asuint(1.0));
+        }
+    }
+}

@@ -1,5 +1,5 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-// Roughness calculation compute shader for ShiftyMapper
+// Terrain roughness calculation
+// Supports standard deviation, range, and area ratio methods
 
 #include "/Engine/Public/Platform.ush"
 

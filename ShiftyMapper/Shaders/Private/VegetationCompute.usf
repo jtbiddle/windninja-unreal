@@ -1,0 +1,354 @@
+// Vegetation suitability mask generation
+// Multi-factor analysis of climate, terrain, and resources
+// Output channels: R=Grass, G=Shrub, B=Tree, A=Bare
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> InputHeightmap;
+Texture2D<float> InputSoilMoisture; // From GroundwaterCompute.usf
+Texture2D<float> InputTemperature; // Optional temperature map
+RWTexture2D<float4> OutputVegetationMasks;
+
+float2 TextureSize;
+float CellSize;
+
+// Climate parameters
+float BaseTemperature; // Base temperature at sea level (°C)
+float TemperatureLapseRate; // Temperature decrease per meter elevation (°C/m)
+float MinGrassTemp; // Minimum temperature for grass (°C)
+float MinTreeTemp; // Minimum temperature for trees (°C)
+
+// Terrain parameters
+float MaxGrassSlope; // Maximum slope for grass (degrees)
+float MaxShrubSlope; // Maximum slope for shrubs (degrees)
+float MaxTreeSlope; // Maximum slope for trees (degrees)
+
+// Resource parameters
+float MinGrassMoisture; // Minimum moisture for grass (0-1)
+float MinShrubMoisture; // Minimum moisture for shrubs (0-1)
+float MinTreeMoisture; // Minimum moisture for trees (0-1)
+
+float GrassOptimalMoisture; // Optimal moisture for grass
+float ShrubOptimalMoisture; // Optimal moisture for shrubs
+float TreeOptimalMoisture; // Optimal moisture for trees
+
+// Curve sampling (simplified - in real implementation, use curve textures)
+uint bUseCurves; // Whether to use curve textures
+Texture2D<float> GrassSlopeCurve;
+Texture2D<float> ShrubSlopeCurve;
+Texture2D<float> TreeSlopeCurve;
+
+// Gaussian curve evaluation
+float GaussianCurve(float x, float optimal, float range)
+{
+	float diff = x - optimal;
+	return exp(-(diff * diff) / (2.0 * range * range));
+}
+
+// Linear falloff curve
+float LinearFalloff(float x, float min, float max)
+{
+	if (x < min)
+		return 0.0;
+	if (x > max)
+		return 0.0;
+	return 1.0 - abs(x - (min + max) * 0.5) / ((max - min) * 0.5);
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void VegetationCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get terrain data
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float soilMoisture = InputSoilMoisture.Load(int3(coord, 0));
+
+	// Calculate slope
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	float dx = (hR - hL) / (2.0 * CellSize);
+	float dy = (hD - hU) / (2.0 * CellSize);
+	float slope = sqrt(dx * dx + dy * dy);
+	float slopeDegrees = atan(slope) * 57.29577951308232;
+
+	// Calculate temperature (elevation-dependent)
+	float temperature = BaseTemperature - (height * TemperatureLapseRate);
+
+	// ========================================================================
+	// GRASS SUITABILITY
+	// ========================================================================
+
+	float grassSuitability = 1.0;
+
+	// Temperature factor
+	if (temperature < MinGrassTemp)
+		grassSuitability = 0.0;
+	else
+		grassSuitability *= GaussianCurve(temperature, 15.0, 10.0); // Optimal 15°C
+
+	// Slope factor
+	if (slopeDegrees > MaxGrassSlope)
+		grassSuitability *= max(0.0, 1.0 - (slopeDegrees - MaxGrassSlope) / 10.0);
+
+	// Moisture factor (grass prefers moderate moisture)
+	if (soilMoisture < MinGrassMoisture)
+		grassSuitability = 0.0;
+	else
+		grassSuitability *= GaussianCurve(soilMoisture, GrassOptimalMoisture, 0.2);
+
+	// ========================================================================
+	// SHRUB SUITABILITY
+	// ========================================================================
+
+	float shrubSuitability = 1.0;
+
+	// Temperature factor (shrubs are more tolerant)
+	if (temperature < MinTreeTemp - 5.0)
+		shrubSuitability = 0.0;
+	else
+		shrubSuitability *= GaussianCurve(temperature, 12.0, 12.0); // Wider range
+
+	// Slope factor (shrubs handle steeper slopes)
+	if (slopeDegrees > MaxShrubSlope)
+		shrubSuitability *= max(0.0, 1.0 - (slopeDegrees - MaxShrubSlope) / 15.0);
+
+	// Moisture factor (shrubs tolerate lower moisture)
+	if (soilMoisture < MinShrubMoisture)
+		shrubSuitability = 0.0;
+	else
+		shrubSuitability *= GaussianCurve(soilMoisture, ShrubOptimalMoisture, 0.25);
+
+	// ========================================================================
+	// TREE SUITABILITY
+	// ========================================================================
+
+	float treeSuitability = 1.0;
+
+	// Temperature factor (trees need warmer temps)
+	if (temperature < MinTreeTemp)
+		treeSuitability = 0.0;
+	else
+		treeSuitability *= GaussianCurve(temperature, 18.0, 8.0); // Optimal 18°C
+
+	// Slope factor (trees need gentler slopes)
+	if (slopeDegrees > MaxTreeSlope)
+		treeSuitability *= max(0.0, 1.0 - (slopeDegrees - MaxTreeSlope) / 5.0);
+
+	// Moisture factor (trees need more moisture)
+	if (soilMoisture < MinTreeMoisture)
+		treeSuitability = 0.0;
+	else
+		treeSuitability *= GaussianCurve(soilMoisture, TreeOptimalMoisture, 0.15);
+
+	// ========================================================================
+	// BARE GROUND (no vegetation)
+	// ========================================================================
+
+	// Bare ground occurs where conditions are too harsh
+	float bareSuitability = 1.0;
+
+	// Extreme slopes
+	if (slopeDegrees > 60.0)
+		bareSuitability = 1.0;
+	else
+		bareSuitability *= saturate((slopeDegrees - 50.0) / 10.0);
+
+	// Very dry
+	if (soilMoisture < 0.1)
+		bareSuitability = max(bareSuitability, 1.0 - soilMoisture * 10.0);
+
+	// Very cold
+	if (temperature < -10.0)
+		bareSuitability = max(bareSuitability, 1.0);
+
+	// ========================================================================
+	// NORMALIZE AND OUTPUT
+	// ========================================================================
+
+	// Clamp all to 0-1
+	grassSuitability = saturate(grassSuitability);
+	shrubSuitability = saturate(shrubSuitability);
+	treeSuitability = saturate(treeSuitability);
+	bareSuitability = saturate(bareSuitability);
+
+	// Normalize so they sum to 1 (optional, allows blending)
+	float total = grassSuitability + shrubSuitability + treeSuitability + bareSuitability;
+	if (total > 0.0001)
+	{
+		grassSuitability /= total;
+		shrubSuitability /= total;
+		treeSuitability /= total;
+		bareSuitability /= total;
+	}
+
+	// Output: R=Grass, G=Shrub, B=Tree, A=Bare
+	OutputVegetationMasks[ThreadId.xy] = float4(
+		grassSuitability,
+		shrubSuitability,
+		treeSuitability,
+		bareSuitability
+	);
+}
+
+// ============================================================================
+// Advanced version with aspect consideration (sun exposure)
+// ============================================================================
+
+Texture2D<float> InputSunlight; // From SunlightCompute.usf
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void VegetationAdvancedCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	// Get all factors
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float soilMoisture = InputSoilMoisture.Load(int3(coord, 0));
+	float sunlight = InputSunlight.Load(int3(coord, 0));
+
+	// Calculate slope and aspect
+	float hL = InputHeightmap.Load(int3(coord + int2(-1, 0), 0));
+	float hR = InputHeightmap.Load(int3(coord + int2(1, 0), 0));
+	float hU = InputHeightmap.Load(int3(coord + int2(0, -1), 0));
+	float hD = InputHeightmap.Load(int3(coord + int2(0, 1), 0));
+
+	float dx = (hR - hL) / (2.0 * CellSize);
+	float dy = (hD - hU) / (2.0 * CellSize);
+	float slope = sqrt(dx * dx + dy * dy);
+	float slopeDegrees = atan(slope) * 57.29577951308232;
+
+	float aspect = atan2(dx, -dy); // Radians
+	if (aspect < 0.0)
+		aspect += 6.28318530717959;
+	float aspectDegrees = aspect * 57.29577951308232;
+
+	// Calculate temperature with aspect adjustment
+	// South-facing slopes (in northern hemisphere) are warmer
+	float aspectBonus = 0.0;
+	if (aspectDegrees > 135.0 && aspectDegrees < 225.0) // South-facing
+		aspectBonus = 2.0; // +2°C
+	else if (aspectDegrees < 45.0 || aspectDegrees > 315.0) // North-facing
+		aspectBonus = -2.0; // -2°C
+
+	float temperature = BaseTemperature - (height * TemperatureLapseRate) + aspectBonus;
+
+	// Calculate suitability (same as before but with sunlight factor)
+	float grassSuitability = 1.0;
+	float shrubSuitability = 1.0;
+	float treeSuitability = 1.0;
+	float bareSuitability = 0.0;
+
+	// Temperature factors
+	grassSuitability *= (temperature < MinGrassTemp) ? 0.0 : GaussianCurve(temperature, 15.0, 10.0);
+	shrubSuitability *= (temperature < MinTreeTemp - 5.0) ? 0.0 : GaussianCurve(temperature, 12.0, 12.0);
+	treeSuitability *= (temperature < MinTreeTemp) ? 0.0 : GaussianCurve(temperature, 18.0, 8.0);
+
+	// Slope factors
+	grassSuitability *= (slopeDegrees > MaxGrassSlope) ? max(0.0, 1.0 - (slopeDegrees - MaxGrassSlope) / 10.0) : 1.0;
+	shrubSuitability *= (slopeDegrees > MaxShrubSlope) ? max(0.0, 1.0 - (slopeDegrees - MaxShrubSlope) / 15.0) : 1.0;
+	treeSuitability *= (slopeDegrees > MaxTreeSlope) ? max(0.0, 1.0 - (slopeDegrees - MaxTreeSlope) / 5.0) : 1.0;
+
+	// Moisture factors
+	grassSuitability *= (soilMoisture < MinGrassMoisture) ? 0.0 : GaussianCurve(soilMoisture, GrassOptimalMoisture, 0.2);
+	shrubSuitability *= (soilMoisture < MinShrubMoisture) ? 0.0 : GaussianCurve(soilMoisture, ShrubOptimalMoisture, 0.25);
+	treeSuitability *= (soilMoisture < MinTreeMoisture) ? 0.0 : GaussianCurve(soilMoisture, TreeOptimalMoisture, 0.15);
+
+	// Sunlight factor (all vegetation needs some sun)
+	float sunlightFactor = saturate(sunlight * 2.0); // Boost low values
+	grassSuitability *= sunlightFactor;
+	shrubSuitability *= sunlightFactor;
+	treeSuitability *= sunlightFactor * 1.2; // Trees benefit more from sun
+
+	// Bare ground in harsh conditions
+	if (slopeDegrees > 60.0 || soilMoisture < 0.1 || temperature < -10.0 || sunlight < 0.1)
+		bareSuitability = 1.0;
+
+	// Normalize
+	grassSuitability = saturate(grassSuitability);
+	shrubSuitability = saturate(shrubSuitability);
+	treeSuitability = saturate(treeSuitability);
+	bareSuitability = saturate(bareSuitability);
+
+	float total = grassSuitability + shrubSuitability + treeSuitability + bareSuitability;
+	if (total > 0.0001)
+	{
+		grassSuitability /= total;
+		shrubSuitability /= total;
+		treeSuitability /= total;
+		bareSuitability /= total;
+	}
+
+	OutputVegetationMasks[ThreadId.xy] = float4(grassSuitability, shrubSuitability, treeSuitability, bareSuitability);
+}
+
+// ============================================================================
+// Biome classification (categorical output)
+// ============================================================================
+
+RWTexture2D<uint> OutputBiomeType;
+
+// Biome types
+#define BIOME_BARE 0
+#define BIOME_TUNDRA 1
+#define BIOME_GRASSLAND 2
+#define BIOME_SHRUBLAND 3
+#define BIOME_FOREST 4
+#define BIOME_RAINFOREST 5
+#define BIOME_DESERT 6
+#define BIOME_ALPINE 7
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BiomeClassificationCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= (uint)TextureSize.x || ThreadId.y >= (uint)TextureSize.y)
+		return;
+
+	int2 coord = int2(ThreadId.xy);
+
+	float height = InputHeightmap.Load(int3(coord, 0));
+	float soilMoisture = InputSoilMoisture.Load(int3(coord, 0));
+	float temperature = BaseTemperature - (height * TemperatureLapseRate);
+
+	uint biome = BIOME_BARE;
+
+	// Decision tree based on climate
+	if (temperature < -5.0)
+	{
+		if (height > 3000.0)
+			biome = BIOME_ALPINE;
+		else
+			biome = BIOME_TUNDRA;
+	}
+	else if (temperature < 10.0)
+	{
+		if (soilMoisture > 0.5)
+			biome = BIOME_FOREST;
+		else if (soilMoisture > 0.3)
+			biome = BIOME_SHRUBLAND;
+		else
+			biome = BIOME_GRASSLAND;
+	}
+	else // temperature >= 10.0
+	{
+		if (soilMoisture < 0.2)
+			biome = BIOME_DESERT;
+		else if (soilMoisture > 0.7)
+			biome = BIOME_RAINFOREST;
+		else if (soilMoisture > 0.4)
+			biome = BIOME_FOREST;
+		else
+			biome = BIOME_GRASSLAND;
+	}
+
+	OutputBiomeType[ThreadId.xy] = biome;
+}

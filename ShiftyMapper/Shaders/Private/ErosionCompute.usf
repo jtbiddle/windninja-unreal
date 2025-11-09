@@ -1,5 +1,5 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-// Hydraulic erosion simulation compute shader for ShiftyMapper
+// Hydraulic erosion simulation using particle-based method
+// Simulates water droplet flow, erosion, and deposition
 
 #include "/Engine/Public/Platform.ush"
 
