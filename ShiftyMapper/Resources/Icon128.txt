@@ -1,0 +1,13 @@
+PLACEHOLDER: Plugin Icon
+
+A 128x128 PNG icon should be placed here as "Icon128.png"
+
+Suggested design:
+- Wind flow arrows over terrain contours
+- Blue/teal color scheme
+- Simple, recognizable at small sizes
+
+This icon will appear in:
+- Plugin browser
+- Plugin settings
+- Editor UI

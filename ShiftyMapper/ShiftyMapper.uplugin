@@ -1,0 +1,25 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "ShiftyMapper",
+	"Description": "General-purpose landscape heightmap analysis and map generation plugin. Generate wind flowmaps, normal maps, curvature maps, erosion maps, and more from heightmap data.",
+	"Category": "Terrain",
+	"CreatedBy": "WindNinja Integration Team",
+	"CreatedByURL": "https://weather.firelab.org/windninja/",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ShiftyMapper",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [ "Win64", "Linux", "Mac" ]
+		}
+	]
+}
